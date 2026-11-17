@@ -1,0 +1,14 @@
+project_name = "mydata"
+environment  = "dev"
+aws_region   = "us-east-1"
+force_destroy = true   # only for non-prod
+
+enable_redshift = false
+# redshift_admin_password = "ChangeMeNow!"
+# private_subnet_ids = ["subnet-xxx", "subnet-yyy"]
+# redshift_security_group_ids = ["sg-xxx"]
+
+tags = {
+  Owner = "data-platform"
+  CostCenter = "analytics"
+}
