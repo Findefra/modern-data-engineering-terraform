@@ -1,0 +1,13 @@
+project_id   = "my-gcp-project-id"
+project_name = "mydata"
+environment  = "dev"
+region       = "us-central1"
+location     = "US"
+force_destroy = true   # only non-prod
+
+enable_composer = false
+
+labels = {
+  owner       = "data-platform"
+  cost_center = "analytics"
+}
