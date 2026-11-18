@@ -2,102 +2,98 @@
 
 **Real production patterns, not marketing diagrams.**
 
-This repo contains opinionated Terraform modules for building a modern data lakehouse on AWS and the equivalent on GCP.  
-It is written from the perspective of someone who has lived through the pain of small-file explosions, Glue job bookmark edge cases, Redshift resize nightmares, Composer cost surprises, and Lake Formation permission hell.
+This repo contains opinionated Terraform modules for building a modern data lakehouse on AWS and the equivalent on GCP.
 
-## Why this exists
+## What's included
 
-Most "data platform" Terraform repos are either:
-- Toy examples that fall over the first time real volume hits, or
-- Enterprise over-engineering that takes 6 months to deploy and is still incomplete.
+### AWS modules
+| Module | Purpose |
+|--------|---------|
+| `s3-data-lake` | Medallion buckets (Raw / Cleaned / Curated) |
+| `glue-catalog-etl` | Catalog, crawler, job roles |
+| `redshift-serverless` | Warehouse + Spectrum-ready |
+| `iam-data-roles` | Least-privilege lake access |
+| `step-functions-orchestration` | Thin Glue orchestration |
+| **`kinesis-firehose`** | Streams (optional) + Firehose → S3 |
+| **`iceberg-tables`** | Glue Catalog Iceberg table defs |
 
-This one aims for the middle: **enough structure to be production-ready, enough pragmatism that a small team can actually ship it**.
+### GCP modules
+| Module | Purpose |
+|--------|---------|
+| `gcs-data-lake` | Landing / Processed / Curated |
+| `bigquery-dataset` | Layered datasets |
+| `iam-data-roles` | Pipeline SA |
+| `composer-env` | Optional Airflow (off by default) |
+| `dataflow-pipeline` | Batch Flex template skeleton |
+| **`pubsub-streaming`** | Topic + sub + DLQ + optional streaming Dataflow |
 
-### Hard lessons baked in
+### CI
+`.github/workflows/terraform-plan.yml` — on PR: `terraform fmt` + `init -backend=false` + `validate` for AWS and GCP examples. Comments results on the PR. Real cloud `plan` is left as an OIDC template (never long-lived keys; never apply from PR).
 
-**AWS**
-- Separate S3 buckets (or very strict prefix + lifecycle) for Raw / Cleaned / Curated. Mixing retention and access patterns in one bucket is a common source of pain later.
-- Iceberg (via Glue or S3 Tables) is the default table format for anything new. Hive-style Parquet + MSCK REPAIR is technical debt.
-- Prefer Redshift Serverless unless you have predictable, high, sustained load. Provisioned clusters still win for some heavy BI workloads, but the operational tax is real.
-- Lake Formation is powerful and also the #1 reason new data platforms get stuck for weeks. Start with Glue Catalog + IAM, add LF later if you actually need column/row security or cross-account sharing.
-- Glue job bookmarks + small files = pain. Compaction is not optional at scale.
-- Step Functions > Glue Workflows for anything non-trivial. Glue Workflows are fine for simple linear jobs; Step Functions give you proper error handling, parallel branches, and visibility.
+## Hard lessons (short form)
 
-**GCP**
-- BigQuery is the center of gravity. Design around it, not around "we need a lake first".
-- Cloud Composer is convenient and expensive. Many teams end up with Cloud Workflows + Dataflow or just Cloud Scheduler + Cloud Functions for simpler pipelines. Use Composer when you truly need Airflow.
-- Prefer BigLake / external tables + BigQuery storage where possible. Materializing everything into BigQuery native tables is often unnecessary and costly.
-- Dataflow Flex Templates > classic templates for new work.
-- GCS lifecycle + Object Versioning + soft delete are your friends. Treat the landing bucket as append-only.
+- **Firehose over Streams** for most lake landing. Streams when you need fan-out. MSK only when Kafka is already a requirement.
+- **Buffer 128MB / 300s** (or larger) on Firehose or you will drown in small files.
+- **Iceberg by default** for tables you evolve or time-travel. Schedule compaction/snapshot expiry.
+- **Pub/Sub without a DLQ** is production debt. Native Pub/Sub → BigQuery when schema is stable.
+- **Streaming ≠ batch** for cost and ops. Don't treat them as the same product.
 
-## Repository Structure
+## Quick usage — streaming + Iceberg (AWS)
 
-```
-.
-├── aws/
-│   ├── modules/
-│   │   ├── s3-data-lake/          # Medallion buckets + lifecycle + encryption
-│   │   ├── glue-catalog-etl/      # Database, crawlers, jobs, IAM roles
-│   │   ├── redshift-serverless/   # Namespace + workgroup + Spectrum
-│   │   ├── iam-data-roles/        # Least-privilege roles for Glue/Redshift/Athena
-│   │   └── step-functions-orchestration/
-│   └── examples/complete/         # Full working example
-├── gcp/
-│   ├── modules/
-│   │   ├── gcs-data-lake/         # Landing / Processed / Curated buckets
-│   │   ├── bigquery-dataset/      # Datasets + tables + external tables
-│   │   ├── composer-env/          # Optional managed Airflow
-│   │   ├── dataflow-pipeline/     # Flex template + service account
-│   │   └── iam-data-roles/
-│   └── examples/complete/
-└── docs/
-```
+```hcl
+module "streaming" {
+  source                 = "../../modules/kinesis-firehose"
+  project_name           = var.project_name
+  environment            = var.environment
+  destination_bucket_arn = module.data_lake.raw_bucket_arn
+  create_kinesis_stream  = false
+  buffering_size_mb      = 128
+  buffering_interval_seconds = 300
+}
 
-## Quick Start (AWS)
-
-```bash
-cd aws/examples/complete
-cp terraform.tfvars.example terraform.tfvars
-# edit project, environment, region, etc.
-terraform init
-terraform plan
-terraform apply
-```
-
-## Quick Start (GCP)
-
-```bash
-cd gcp/examples/complete
-# set project_id, region, etc.
-terraform init
-terraform plan
-terraform apply
+module "iceberg" {
+  source        = "../../modules/iceberg-tables"
+  project_name  = var.project_name
+  environment   = var.environment
+  database_name = module.glue.glue_database_name
+  tables = [{
+    name     = "events_silver"
+    location = "s3://${module.data_lake.cleaned_bucket_id}/events/"
+    columns = [
+      { name = "event_id", type = "string" },
+      { name = "event_ts", type = "timestamp" }
+    ]
+    partition_keys = [{ name = "event_date", type = "date" }]
+  }]
+}
 ```
 
-## Design Principles Used Here
+## Quick usage — streaming (GCP)
 
-1. **Modules are composition units, not thin wrappers.** A module should own a coherent piece of the platform (data lake storage, catalog + ETL, warehouse, orchestration).
-2. **Environment isolation by design.** Separate state, separate buckets/datasets, separate workgroups. Shared "dev/prod" resources are a recurring source of incidents.
-3. **Encryption and logging on by default.** You can turn things down; you should not have to remember to turn them on.
-4. **Explicit over clever.** No dynamic module generation magic that makes `terraform plan` unreadable.
-5. **Idempotent and re-runnable.** Jobs and pipelines should be safe to re-execute.
+```hcl
+module "streaming" {
+  source       = "../../modules/pubsub-streaming"
+  project_id   = var.project_id
+  project_name = var.project_name
+  environment  = var.environment
+  region       = var.region
+  # bigquery_table = "${var.project_id}.${module.bigquery.raw_dataset_id}.events"
+  create_dataflow_streaming_job = false
+}
+```
 
-## What is intentionally left out (for now)
+## Docs
 
-- Full Lake Formation multi-account sharing (add when you need it)
-- Streaming (Kinesis / Pub/Sub + Flink / Dataflow streaming) — modules can be extended
-- Advanced data quality frameworks (Great Expectations / Soda / Glue DQ) — wire them in as jobs
+- `docs/REAL_WORLD_NOTES.md` — broader platform scars
+- `docs/STREAMING_AND_ICEBERG.md` — operator notes for the new modules
+
+## Still left out on purpose
+
+- Full Lake Formation multi-account sharing
+- Full MSK cluster module (org-specific networking/auth)
+- Advanced DQ frameworks
 - Multi-region active-active
-
-These are real gaps. Document them in your own ADRs so future you doesn't pretend they were never considered.
-
-## Contributing / Extending
-
-If you add a module, include:
-- A working `examples/` usage
-- Clear inputs/outputs
-- Notes on cost and failure modes
 
 ---
 
-Built for people who have to operate this stuff at 2 a.m.
+Repo: https://github.com/Findefra/modern-data-engineering-terraform
